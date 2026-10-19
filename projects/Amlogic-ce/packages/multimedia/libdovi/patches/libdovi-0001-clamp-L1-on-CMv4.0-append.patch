@@ -1,0 +1,104 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: samtheruby <peasea1012@gmail.com>
+Date: Mon, 19 Oct 2026 21:13:11 +0000
+Subject: [PATCH] rpu: clamp L1 to CM v4.0 limits when appending CMv4.0
+
+add_cmv40_safe_default_metadata turns a CM v2.9 RPU into a CM v4.0 one
+but keeps its L1 as is. CM v2.9 allows avg_pq down to 819 and any
+min_pq, while CM v4.0 needs avg_pq >= 1229 and min_pq <= 12, so dark
+scenes end up with L1 values that are invalid for the new CM version.
+
+Clamp the existing L1 blocks with clamp_values_cm_version(V40), the
+same limits the generator applies.
+---
+ dolby_vision/src/rpu/dovi_rpu.rs | 66 +++++++++++++++++++++++++++++++-
+ 1 file changed, 65 insertions(+), 1 deletion(-)
+
+diff --git a/dolby_vision/src/rpu/dovi_rpu.rs b/dolby_vision/src/rpu/dovi_rpu.rs
+index b6ff697..a1ec9a8 100644
+--- a/dolby_vision/src/rpu/dovi_rpu.rs
++++ b/dolby_vision/src/rpu/dovi_rpu.rs
+@@ -14,7 +14,7 @@ use super::profiles::profile84::Profile84;
+ use super::rpu_data_header::RpuDataHeader;
+ use super::rpu_data_mapping::{DoviNlqMethod, RpuDataMapping};
+ use super::rpu_data_nlq::{DoviELType, RpuDataNlq};
+-use super::vdr_dm_data::{VdrDmData, vdr_dm_data_payload};
++use super::vdr_dm_data::{CmVersion, VdrDmData, vdr_dm_data_payload};
+ use super::{ConversionMode, compute_crc32};
+ 
+ use crate::av1::{
+@@ -588,6 +588,15 @@ impl DoviRpu {
+                 .cmv40_metadata
+                 .insert(DmData::V40(CmV40DmData::default_safe()));
+ 
++            // L1 written for CM v2.9 may be below the CM v4.0 limits
++            // (avg_pq 819..1228, min_pq above 12). Clamp it the same way
++            // the generator does, so the RPU stays valid for CM v4.0.
++            vdr_dm_data.level_blocks_iter_mut(1).for_each(|block| {
++                if let ExtMetadataBlock::Level1(level1) = block {
++                    level1.clamp_values_cm_version(CmVersion::V40);
++                }
++            });
++
+             true
+         } else {
+             false
+@@ -651,3 +660,58 @@ impl DoviRpu {
+         self.replace_levels_from_rpu(src_rpu, levels)
+     }
+ }
++
++#[cfg(test)]
++mod cmv40_append_tests {
++    use super::DoviRpu;
++    use crate::rpu::extension_metadata::blocks::{ExtMetadataBlock, ExtMetadataBlockLevel1};
++    use crate::rpu::generate::GenerateConfig;
++    use crate::rpu::vdr_dm_data::CmVersion;
++
++    fn cmv29_rpu(min_pq: u16, max_pq: u16, avg_pq: u16) -> DoviRpu {
++        let config = GenerateConfig {
++            cm_version: CmVersion::V29,
++            length: 1,
++            default_metadata_blocks: vec![ExtMetadataBlock::Level1(ExtMetadataBlockLevel1::new(
++                min_pq, max_pq, avg_pq,
++            ))],
++            ..Default::default()
++        };
++
++        DoviRpu::profile81_config(&config).unwrap()
++    }
++
++    /// Append CMv4.0, write the RPU and parse it back like a decoder would.
++    fn l1_after_append(mut rpu: DoviRpu) -> ExtMetadataBlockLevel1 {
++        assert!(rpu.add_cmv40_safe_default_metadata().unwrap());
++
++        let nalu = rpu.write_hevc_unspec62_nalu().unwrap();
++        let parsed = DoviRpu::parse_unspec62_nalu(&nalu).unwrap();
++        let vdr_dm_data = parsed.vdr_dm_data.unwrap();
++        assert!(vdr_dm_data.cmv40_metadata.is_some());
++
++        match vdr_dm_data.get_block(1) {
++            Some(ExtMetadataBlock::Level1(l1)) => l1.clone(),
++            _ => panic!("L1 missing after CMv4.0 append"),
++        }
++    }
++
++    #[test]
++    fn append_raises_l1_to_cmv40_limits() {
++        // Valid CM v2.9 values that are out of range for CM v4.0.
++        let l1 = l1_after_append(cmv29_rpu(62, 2081, 819));
++
++        assert_eq!(l1.min_pq, 12);
++        assert_eq!(l1.avg_pq, 1229);
++        assert_eq!(l1.max_pq, 2081);
++    }
++
++    #[test]
++    fn append_keeps_l1_already_valid_for_cmv40() {
++        let l1 = l1_after_append(cmv29_rpu(7, 3079, 1500));
++
++        assert_eq!(l1.min_pq, 7);
++        assert_eq!(l1.avg_pq, 1500);
++        assert_eq!(l1.max_pq, 3079);
++    }
++}
